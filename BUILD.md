@@ -38,9 +38,19 @@ You can run the proxy locally, outside of a k8s environment for development.
 LINKERD2_PROXY_LOG=debug LINKERD2_PROXY_POD_NAMESPACE=linkerd cargo run
 ```
 
-You should then be able to proxy a request.
+If you watch the logs, you'll notice that routing is performed on `127.0.0.1:4140` and proxying on `0.0.0.0:4143`.
 
+- 4140 is the outbound listener: Proxy outbound traffic
+- 4143 is the inbound listener: Reverse Proxy inbound traffic
+
+
+This mimics proxying a request originating from localhost.
 ```
 docker run -p 8080:80 nginx:1.7.9
 curl -iv 127.0.0.1:4140 -H "Host: localhost:8080"
+```
+
+This mimics reverse proxying a request originating from outside localhost which is inbound to localhost.
+```
+TBD
 ```
