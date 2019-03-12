@@ -285,6 +285,7 @@ where
             });
 
             let stack = connect::Stack::new()
+                .push(svc::tracing::layer(String::from("outbound")))
                 .push(keepalive::connect::layer(keepalive))
                 .push(control::client::layer())
                 .push(control::resolve::layer(dns_resolver.clone()))
@@ -498,6 +499,7 @@ where
                 .map(shared::stack)
                 .expect("outbound addr router")
                 .push(phantom_data::layer());
+                .push(svc::tracing::layer(String::from("inbound")))
 
             // Instantiates an HTTP service for each `Source` using the
             // shared `addr_router`. The `Source` is stored in the request's
