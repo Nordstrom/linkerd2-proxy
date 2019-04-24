@@ -17,7 +17,7 @@ PKG = $(PKG_NAME).tar.gz
 SHASUM = shasum -a 256
 
 CARGO ?= cargo
-CARGO_BUILD = $(CARGO) build --frozen $(RELEASE)
+CARGO_BUILD = $(CARGO) build --verbose --frozen $(RELEASE)
 CARGO_TEST = $(CARGO) test --all --frozen $(RELEASE)
 CARGO_FMT = $(CARGO) fmt --all
 
@@ -50,7 +50,7 @@ endif
 		tar -czvf $(PKG) $(PKG_NAME) && \
 		($(SHASUM) $(PKG) >$(PKG_NAME).txt) && \
 		cp $(PKG_NAME).txt latest.txt
-	rm -rf $(PKG_BASE)
+	# rm -rf $(PKG_BASE)
 
 .PHONY: fetch
 fetch: Cargo.lock

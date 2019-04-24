@@ -1,0 +1,20 @@
+# Proxy build and runtime
+#
+# This is intended **DEVELOPMENT ONLY**, i.e. so that proxy developers can
+# easily test the proxy in the context of the larger `linkerd2` project.
+#
+# When PROXY_UNOPTIMIZED is set and not empty, unoptimized rust artifacts are produced.
+# This reduces build time and produces binaries with debug symbols, at the expense of
+# runtime performance.
+
+# rather than updating this manually, run update-rust-version.sh
+ARG RUST_IMAGE=rust:1.33.0
+
+## Builds the proxy as incrementally as possible.
+FROM $RUST_IMAGE
+
+WORKDIR /usr/src/linkerd2-proxy
+
+# Fetch external dependencies.
+COPY . ./
+RUN make package
