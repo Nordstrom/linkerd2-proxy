@@ -103,4 +103,5 @@ debug = false
 debug = false
 
 [patch.crates-io]
-webpki = { git = "https://github.com/seanmonstar/webpki", branch = "cert-dns-names" }
+webpki = { git = "https://github.com/nordstrom/webpki", branch = "0.19.1+seanmonstar+cody" }
+rustls = { git = "https://github.com/nordstrom/rustls", branch = "0.15.1-rsa_nonull" }
