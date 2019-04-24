@@ -17,7 +17,7 @@ PKG = $(PKG_NAME).tar.gz
 SHASUM = shasum -a 256
 
 CARGO ?= cargo
-CARGO_BUILD = $(CARGO) build --frozen $(RELEASE)
+CARGO_BUILD = $(CARGO) build #--frozen $(RELEASE)
 CARGO_TEST = $(CARGO) test --all --frozen $(RELEASE)
 CARGO_FMT = $(CARGO) fmt --all
 

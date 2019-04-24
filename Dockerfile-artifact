@@ -1,0 +1,15 @@
+ARG RUST_IMAGE=rust:1.33.0
+ARG ARTIFACTORY_API_KEY
+
+## Builds the proxy as incrementally as possible.
+FROM $RUST_IMAGE as build
+
+WORKDIR /usr/src/linkerd2-proxy
+
+COPY . .
+
+RUN make package
+#RUN curl -H "X-JFrog-Art-Api:$ARTIFACTORY_API_KEY" -T target/debug/package/latest.txt "https://artifactory.nordstrom.com/artifactory/generic-local/moocow/latest.txt"
+
+RUN (ld_file=$(ls target/debug/package/ | grep -i tar) && \
+     curl -H "X-JFrog-Art-Api:$ARTIFACTORY_API_KEY" -T "target/debug/package/$ld_file" "https://artifactory.nordstrom.com/artifactory/generic-local/linkerd2-proxy/$ld_file")
