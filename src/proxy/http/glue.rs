@@ -1,13 +1,12 @@
 use futures::{Async, Future, Poll};
-use h2;
 use http;
 use hyper::client::connect as hyper_connect;
 use hyper::{self, body::Payload};
-use std::{error::Error as StdError, fmt};
 
+use proxy;
 use proxy::http::{upgrade::Http11Upgrade, HasH2Reason};
 use svc;
-use transport::{tls::HasStatus as HasTlsStatus, Connect};
+use transport::tls::HasStatus as HasTlsStatus;
 use Conditional;
 
 /// Provides optional HTTP/1.1 upgrade support on the body.
@@ -27,9 +26,10 @@ pub struct HyperServerSvc<S> {
 
 /// Glue for any `tokio_connect::Connect` to implement `hyper::client::Connect`.
 #[derive(Debug, Clone)]
-pub struct HyperConnect<C> {
+pub struct HyperConnect<C, T> {
     connect: C,
     absolute_form: bool,
+    target: T,
 }
 
 /// Future returned by `HyperConnect`.
@@ -37,9 +37,6 @@ pub struct HyperConnectFuture<F> {
     inner: F,
     absolute_form: bool,
 }
-
-/// Wrapper of hyper::Error so we can add methods.
-pub struct Error(hyper::Error);
 
 /// Marker in `Response` extensions if the connection used TLS.
 #[derive(Clone, Debug)]
@@ -49,7 +46,7 @@ pub struct ClientUsedTls(pub(super) ());
 
 impl Payload for HttpBody {
     type Data = hyper::body::Chunk;
-    type Error = h2::Error;
+    type Error = hyper::Error;
 
     fn is_end_stream(&self) -> bool {
         self.body
@@ -65,10 +62,7 @@ impl Payload for HttpBody {
             .poll_data()
             .map_err(|e| {
                 debug!("http body error: {}", e);
-                Error(e)
-                    .h2_reason()
-                    .unwrap_or(h2::Reason::INTERNAL_ERROR)
-                    .into()
+                e
             })
     }
 
@@ -79,17 +73,14 @@ impl Payload for HttpBody {
             .poll_trailers()
             .map_err(|e| {
                 debug!("http trailers error: {}", e);
-                Error(e)
-                    .h2_reason()
-                    .unwrap_or(h2::Reason::INTERNAL_ERROR)
-                    .into()
+                e
             })
     }
 }
 
 impl tower_http_service::Body for HttpBody {
     type Item = hyper::body::Chunk;
-    type Error = h2::Error;
+    type Error = hyper::Error;
 
     fn is_end_stream(&self) -> bool {
         Payload::is_end_stream(self)
@@ -144,13 +135,17 @@ impl<S> HyperServerSvc<S> {
 impl<S, B> hyper::service::Service for HyperServerSvc<S>
 where
     S: svc::Service<http::Request<HttpBody>, Response = http::Response<B>>,
-    S::Error: Into<Box<dyn StdError + Send + Sync>>,
+    S::Error: Into<proxy::Error>,
     B: Payload,
 {
     type ReqBody = hyper::Body;
     type ResBody = B;
     type Error = S::Error;
     type Future = S::Future;
+
+    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+        self.service.poll_ready()
+    }
 
     fn call(&mut self, req: http::Request<Self::ReqBody>) -> Self::Future {
         self.service.call(req.map(|b| HttpBody {
@@ -162,33 +157,31 @@ where
 
 // ===== impl HyperConnect =====
 
-impl<C> HyperConnect<C>
-where
-    C: Connect,
-    C::Future: 'static,
-{
-    pub(in proxy) fn new(connect: C, absolute_form: bool) -> Self {
+impl<C, T> HyperConnect<C, T> {
+    pub(super) fn new(connect: C, target: T, absolute_form: bool) -> Self {
         HyperConnect {
             connect,
             absolute_form,
+            target,
         }
     }
 }
 
-impl<C> hyper_connect::Connect for HyperConnect<C>
+impl<C, T> hyper_connect::Connect for HyperConnect<C, T>
 where
-    C: Connect + Send + Sync,
+    C: svc::MakeConnection<T> + Clone + Send + Sync,
     C::Future: Send + 'static,
-    <C::Future as Future>::Error: Into<Box<dyn StdError + Send + Sync>>,
-    C::Connected: HasTlsStatus + Send + 'static,
+    <C::Future as Future>::Error: Into<proxy::Error>,
+    C::Connection: HasTlsStatus + Send + 'static,
+    T: Clone + Send + Sync,
 {
-    type Transport = C::Connected;
+    type Transport = C::Connection;
     type Error = <C::Future as Future>::Error;
     type Future = HyperConnectFuture<C::Future>;
 
     fn connect(&self, _dst: hyper_connect::Destination) -> Self::Future {
         HyperConnectFuture {
-            inner: self.connect.connect(),
+            inner: self.connect.clone().make_connection(self.target.clone()),
             absolute_form: self.absolute_form,
         }
     }
@@ -198,7 +191,7 @@ impl<F> Future for HyperConnectFuture<F>
 where
     F: Future + 'static,
     F::Item: HasTlsStatus,
-    F::Error: Into<Box<dyn StdError + Send + Sync>>,
+    F::Error: Into<proxy::Error>,
 {
     type Item = (F::Item, hyper_connect::Connected);
     type Error = F::Error;
@@ -217,35 +210,8 @@ where
 
 // === impl Error ===
 
-impl HasH2Reason for Error {
+impl HasH2Reason for hyper::Error {
     fn h2_reason(&self) -> Option<h2::Reason> {
-        self.0
-            .cause2()
-            .and_then(|cause| cause.downcast_ref::<h2::Error>())
-            .and_then(|err| err.reason())
-    }
-}
-
-impl From<hyper::Error> for Error {
-    fn from(err: hyper::Error) -> Error {
-        Error(err)
-    }
-}
-
-impl fmt::Debug for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Debug::fmt(&self.0, f)
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl StdError for Error {
-    fn source(&self) -> Option<&(StdError + 'static)> {
-        self.0.source()
+        (self as &(dyn std::error::Error + 'static)).h2_reason()
     }
 }

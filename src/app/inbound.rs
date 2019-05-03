@@ -7,7 +7,7 @@ use std::sync::Arc;
 use super::classify;
 use super::dst::DstAddr;
 use super::identity;
-use proxy::http::router;
+use proxy::http::{router, settings};
 use proxy::server::Source;
 use tap;
 use transport::{connect, tls};
@@ -17,6 +17,7 @@ use {Conditional, NameAddr};
 pub struct Endpoint {
     pub addr: SocketAddr,
     pub dst_name: Option<NameAddr>,
+    pub http_settings: settings::Settings,
     pub tls_client_id: tls::PeerIdentity,
 }
 
@@ -32,6 +33,7 @@ impl From<SocketAddr> for Endpoint {
         Self {
             addr,
             dst_name: None,
+            http_settings: settings::Settings::NotHttp,
             tls_client_id: Conditional::None(tls::ReasonForNoPeerName::NotHttp.into()),
         }
     }
@@ -46,6 +48,12 @@ impl connect::HasPeerAddr for Endpoint {
 impl tls::HasPeerIdentity for Endpoint {
     fn peer_identity(&self) -> tls::PeerIdentity {
         Conditional::None(tls::ReasonForNoPeerName::Loopback.into())
+    }
+}
+
+impl settings::HasSettings for Endpoint {
+    fn http_settings(&self) -> &settings::Settings {
+        &self.http_settings
     }
 }
 
@@ -126,22 +134,30 @@ impl<A> router::Recognize<http::Request<A>> for RecognizeEndpoint {
             .map(|s| s.tls_peer.clone())
             .unwrap_or_else(|| Conditional::None(tls::ReasonForNoIdentity::Disabled));
 
-        let dst_name = req
+        let dst_addr = req
             .extensions()
             .get::<DstAddr>()
-            .and_then(|a| a.as_ref().name_addr())
-            .cloned();
-        debug!("inbound endpoint: dst={:?}", dst_name);
+            .expect("request extensions should have DstAddr");
+
+        let dst_name = dst_addr.as_ref().name_addr().cloned();
+        let http_settings = dst_addr.http_settings;
+
+        debug!(
+            "inbound endpoint: dst={:?}, proto={:?}",
+            dst_name, http_settings
+        );
 
         Some(Endpoint {
             addr,
             dst_name,
+            http_settings,
             tls_client_id,
         })
     }
 }
 
 pub mod orig_proto_downgrade {
+    use futures::{Future, Poll};
     use http;
     use proxy::http::orig_proto;
     use proxy::server::Source;
@@ -169,16 +185,13 @@ pub mod orig_proto_downgrade {
         }
     }
 
-    impl<M, A, B> svc::Layer<Source, Source, M> for Layer<A, B>
+    impl<M, A, B> svc::Layer<M> for Layer<A, B>
     where
-        M: svc::Stack<Source>,
-        M::Value: svc::Service<http::Request<A>, Response = http::Response<B>>,
+        M: svc::MakeService<Source, http::Request<A>, Response = http::Response<B>>,
     {
-        type Value = <Stack<M, A, B> as svc::Stack<Source>>::Value;
-        type Error = <Stack<M, A, B> as svc::Stack<Source>>::Error;
-        type Stack = Stack<M, A, B>;
+        type Service = Stack<M, A, B>;
 
-        fn bind(&self, inner: M) -> Self::Stack {
+        fn layer(&self, inner: M) -> Self::Service {
             Stack {
                 inner,
                 _marker: PhantomData,
@@ -197,21 +210,27 @@ pub mod orig_proto_downgrade {
         }
     }
 
-    impl<M, A, B> svc::Stack<Source> for Stack<M, A, B>
+    impl<M, A, B> svc::Service<Source> for Stack<M, A, B>
     where
-        M: svc::Stack<Source>,
-        M::Value: svc::Service<http::Request<A>, Response = http::Response<B>>,
+        M: svc::MakeService<Source, http::Request<A>, Response = http::Response<B>>,
     {
-        type Value = orig_proto::Downgrade<M::Value>;
-        type Error = M::Error;
+        type Response = orig_proto::Downgrade<M::Service>;
+        type Error = M::MakeError;
+        type Future = futures::future::Map<M::Future, fn(M::Service) -> Self::Response>;
 
-        fn make(&self, target: &Source) -> Result<Self::Value, Self::Error> {
+        fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+            self.inner.poll_ready()
+        }
+
+        fn call(&mut self, target: Source) -> Self::Future {
             trace!(
                 "supporting {} downgrades for source={:?}",
                 orig_proto::L5D_ORIG_PROTO,
                 target,
             );
-            self.inner.make(&target).map(orig_proto::Downgrade::new)
+            self.inner
+                .make_service(target)
+                .map(orig_proto::Downgrade::new)
         }
     }
 }
@@ -219,56 +238,16 @@ pub mod orig_proto_downgrade {
 /// Rewrites connect `SocketAddr`s IP address to the loopback address (`127.0.0.1`),
 /// with the same port still set.
 pub mod rewrite_loopback_addr {
+    use super::Endpoint;
     use std::net::SocketAddr;
-    use svc;
+    use svc::stack::map_target;
 
-    #[derive(Debug, Clone)]
-    pub struct Layer;
-
-    #[derive(Clone, Debug)]
-    pub struct Stack<M>
-    where
-        M: svc::Stack<super::Endpoint>,
-    {
-        inner: M,
-    }
-
-    // === impl Layer ===
-
-    pub fn layer() -> Layer {
-        Layer
-    }
-
-    impl<M> svc::Layer<super::Endpoint, super::Endpoint, M> for Layer
-    where
-        M: svc::Stack<super::Endpoint>,
-    {
-        type Value = <Stack<M> as svc::Stack<super::Endpoint>>::Value;
-        type Error = <Stack<M> as svc::Stack<super::Endpoint>>::Error;
-        type Stack = Stack<M>;
-
-        fn bind(&self, inner: M) -> Self::Stack {
-            Stack { inner }
-        }
-    }
-
-    // === impl Stack ===
-
-    impl<M> svc::Stack<super::Endpoint> for Stack<M>
-    where
-        M: svc::Stack<super::Endpoint>,
-    {
-        type Value = M::Value;
-        type Error = M::Error;
-
-        fn make(&self, ep: &super::Endpoint) -> Result<Self::Value, Self::Error> {
+    pub fn layer() -> map_target::Layer<impl Fn(Endpoint) -> Endpoint + Copy> {
+        map_target::layer(|mut ep: Endpoint| {
             debug!("rewriting inbound address to loopback; addr={:?}", ep.addr);
-
-            let mut ep = ep.clone();
             ep.addr = SocketAddr::from(([127, 0, 0, 1], ep.addr.port()));
-
-            self.inner.make(&ep)
-        }
+            ep
+        })
     }
 }
 
@@ -329,18 +308,28 @@ mod tests {
     use std::net;
 
     use super::{Endpoint, RecognizeEndpoint};
-    use proxy::http::router::Recognize;
+    use proxy::http::{router::Recognize, Settings};
     use proxy::server::Source;
     use transport::tls;
     use Conditional;
 
-    fn make_h1_endpoint(addr: net::SocketAddr) -> Endpoint {
+    fn make_test_endpoint(addr: net::SocketAddr) -> Endpoint {
         let tls_client_id = TLS_DISABLED;
         Endpoint {
             addr,
             dst_name: None,
+            http_settings: Settings::Http2,
             tls_client_id,
         }
+    }
+
+    fn dst_addr(req: &mut http::Request<()>) {
+        use app::dst::DstAddr;
+        use Addr;
+        req.extensions_mut().insert(DstAddr::inbound(
+            Addr::Socket(([0, 0, 0, 0], 0).into()),
+            Settings::Http2,
+        ));
     }
 
     const TLS_DISABLED: tls::PeerIdentity = Conditional::None(tls::ReasonForNoIdentity::Disabled);
@@ -352,10 +341,11 @@ mod tests {
             remote: net::SocketAddr
         ) -> bool {
             let src = Source::for_test(remote, local, Some(orig_dst), TLS_DISABLED);
-            let rec = src.orig_dst_if_not_local().map(make_h1_endpoint);
+            let rec = src.orig_dst_if_not_local().map(make_test_endpoint);
 
             let mut req = http::Request::new(());
             req.extensions_mut().insert(src);
+            dst_addr(&mut req);
 
             RecognizeEndpoint::default().recognize(&req) == rec
         }
@@ -368,13 +358,15 @@ mod tests {
             let mut req = http::Request::new(());
             req.extensions_mut()
                 .insert(Source::for_test(remote, local, None, TLS_DISABLED));
+            dst_addr(&mut req);
 
-            RecognizeEndpoint::new(default).recognize(&req) == default.map(make_h1_endpoint)
+            RecognizeEndpoint::new(default).recognize(&req) == default.map(make_test_endpoint)
         }
 
         fn recognize_default_no_ctx(default: Option<net::SocketAddr>) -> bool {
-            let req = http::Request::new(());
-            RecognizeEndpoint::new(default).recognize(&req) == default.map(make_h1_endpoint)
+            let mut req = http::Request::new(());
+            dst_addr(&mut req);
+            RecognizeEndpoint::new(default).recognize(&req) == default.map(make_test_endpoint)
         }
 
         fn recognize_default_no_loop(
@@ -385,8 +377,9 @@ mod tests {
             let mut req = http::Request::new(());
             req.extensions_mut()
                 .insert(Source::for_test(remote, local, Some(local), TLS_DISABLED));
+            dst_addr(&mut req);
 
-            RecognizeEndpoint::new(default).recognize(&req) == default.map(make_h1_endpoint)
+            RecognizeEndpoint::new(default).recognize(&req) == default.map(make_test_endpoint)
         }
     }
 }

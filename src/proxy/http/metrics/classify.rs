@@ -1,4 +1,4 @@
-use futures::Poll;
+use futures::{Future, Poll};
 use http;
 
 use svc;
@@ -6,20 +6,15 @@ use svc;
 /// Determines how a request's response should be classified.
 pub trait Classify {
     type Class;
-    type Error;
-
-    type ClassifyEos: ClassifyEos<Class = Self::Class, Error = Self::Error>;
+    type ClassifyEos: ClassifyEos<Class = Self::Class>;
 
     /// Classifies responses.
     ///
     /// Instances are intended to be used as an `http::Extension` that may be
     /// cloned to inner stack layers. Cloned instances are **not** intended to
     /// share state. Each clone should maintain its own internal state.
-    type ClassifyResponse: ClassifyResponse<
-            Class = Self::Class,
-            Error = Self::Error,
-            ClassifyEos = Self::ClassifyEos,
-        > + Clone
+    type ClassifyResponse: ClassifyResponse<Class = Self::Class, ClassifyEos = Self::ClassifyEos>
+        + Clone
         + Send
         + Sync
         + 'static;
@@ -31,19 +26,17 @@ pub trait Classify {
 pub trait ClassifyResponse {
     /// A response classification.
     type Class;
-    type Error;
-    type ClassifyEos: ClassifyEos<Class = Self::Class, Error = Self::Error>;
+    type ClassifyEos: ClassifyEos<Class = Self::Class>;
 
     /// Produce a stream classifier for this response.
     fn start<B>(self, headers: &http::Response<B>) -> Self::ClassifyEos;
 
     /// Classifies the given error.
-    fn error(self, error: &Self::Error) -> Self::Class;
+    fn error(self, error: &(dyn std::error::Error + 'static)) -> Self::Class;
 }
 
 pub trait ClassifyEos {
     type Class;
-    type Error;
 
     /// Update the classifier with an EOS.
     ///
@@ -54,7 +47,7 @@ pub trait ClassifyEos {
     ///
     /// Because errors indicate an end-of-stream, a classification must be
     /// returned.
-    fn error(self, error: &Self::Error) -> Self::Class;
+    fn error(self, error: &(dyn std::error::Error + 'static)) -> Self::Class;
 }
 
 // Used for stack targets that can produce a `Classify` implementation.
@@ -72,6 +65,11 @@ pub struct Stack<M> {
     inner: M,
 }
 
+pub struct MakeFuture<C, F> {
+    classify: Option<C>,
+    inner: F,
+}
+
 #[derive(Clone, Debug)]
 pub struct Service<C, S> {
     classify: C,
@@ -82,32 +80,42 @@ pub fn layer() -> Layer {
     Layer()
 }
 
-impl<T, M> svc::Layer<T, T, M> for Layer
-where
-    T: CanClassify,
-    M: svc::Stack<T>,
-{
-    type Value = <Stack<M> as svc::Stack<T>>::Value;
-    type Error = <Stack<M> as svc::Stack<T>>::Error;
-    type Stack = Stack<M>;
+impl<M> svc::Layer<M> for Layer {
+    type Service = Stack<M>;
 
-    fn bind(&self, inner: M) -> Self::Stack {
+    fn layer(&self, inner: M) -> Self::Service {
         Stack { inner }
     }
 }
 
-impl<T, M> svc::Stack<T> for Stack<M>
+impl<T, M> svc::Service<T> for Stack<M>
 where
     T: CanClassify,
-    M: svc::Stack<T>,
+    M: svc::Service<T>,
 {
-    type Value = Service<T::Classify, M::Value>;
+    type Response = Service<T::Classify, M::Response>;
     type Error = M::Error;
+    type Future = MakeFuture<T::Classify, M::Future>;
 
-    fn make(&self, target: &T) -> Result<Self::Value, Self::Error> {
-        let inner = self.inner.make(target)?;
-        let classify = target.classify();
-        Ok(Service { classify, inner })
+    fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+        self.inner.poll_ready()
+    }
+
+    fn call(&mut self, target: T) -> Self::Future {
+        let classify = Some(target.classify());
+        let inner = self.inner.call(target);
+        MakeFuture { classify, inner }
+    }
+}
+
+impl<C, F: Future> Future for MakeFuture<C, F> {
+    type Item = Service<C, F::Item>;
+    type Error = F::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let inner = try_ready!(self.inner.poll());
+        let classify = self.classify.take().expect("polled more than once");
+        Ok(Service { classify, inner }.into())
     }
 }
 

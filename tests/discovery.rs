@@ -127,8 +127,8 @@ macro_rules! generate_tests {
             // maximum number of Destination resolutions.
             for n in 1..num_dests {
                 let route = format!("disco{}.test.svc.cluster.local", n);
-                let client = $make_client(proxy.outbound, route);
-                println!("trying {}th destination...", n);
+                let client = $make_client(proxy.outbound, &*route);
+                println!("expecting GET {} to be OK", route);
                 assert_eq!(client.get("/"), "hello");
             }
 
@@ -139,7 +139,7 @@ macro_rules! generate_tests {
             // active.
             let nth_host = format!("disco{}.test.svc.cluster.local", num_dests);
             let client = $make_client(proxy.outbound, &*nth_host);
-            println!("trying {}th destination...", num_dests);
+            println!("expecting GET {} destination to HANG...", nth_host);
             let mut req = client.request_builder("/");
             client
                 .request_async(req.method("GET"))
@@ -163,7 +163,7 @@ macro_rules! generate_tests {
             // requests that add a new route will evict an inactive route. This
             // should drop their Destination resolutions, so we should now be
             // able to open a new one.
-            println!("trying {}th destination again...", num_dests);
+            println!("expecting GET {} destination to be OK", nth_host);
             let client = $make_client(proxy.outbound, &*nth_host);
             assert_eq!(client.get("/"), "hello");
         }
@@ -338,6 +338,26 @@ macro_rules! generate_tests {
         }
 
         #[test]
+        fn outbound_skips_controller_if_destination_is_address() {
+            let _ = init_env();
+
+            let srv = $make_server()
+                .route("/", "hello")
+                .route("/bye", "bye")
+                .run();
+
+            let host = srv.addr.to_string();
+
+            // don't set outbound() or controller()
+            let proxy = proxy::new()
+                .run();
+            let client = $make_client(proxy.outbound, &*host);
+
+            assert_eq!(client.get("/"), "hello");
+            assert_eq!(client.get("/bye"), "bye");
+        }
+
+        #[test]
         fn outbound_error_reconnects_after_backoff() {
             let mut env = init_env();
 
@@ -354,7 +374,9 @@ macro_rules! generate_tests {
             dst_tx.send_addr(srv.addr);
             // but don't drop, to not trigger stream closing reconnects
 
-            env.put(app::config::ENV_CONTROL_BACKOFF_DELAY, "100ms".to_owned());
+            env.put(app::config::ENV_CONTROL_EXP_BACKOFF_MIN, "100ms".to_owned());
+            env.put(app::config::ENV_CONTROL_EXP_BACKOFF_MAX, "300ms".to_owned());
+            env.put(app::config::ENV_CONTROL_EXP_BACKOFF_JITTER, "0.1".to_owned());
 
             let proxy = proxy::new()
                 .controller(ctrl.delay_listen(rx.map_err(|_| ())))
@@ -641,6 +663,56 @@ mod http2 {
 
     generate_tests! { server: server::new, client: client::new }
 
+    #[test]
+    fn outbound_balancer_waits_for_ready_endpoint() {
+        // See https://github.com/linkerd/linkerd2/issues/2550
+        let _ = env_logger_init();
+
+        let srv1 = server::http2()
+            .route("/", "hello")
+            .route("/bye", "bye")
+            .run();
+
+        let srv2 = server::http2()
+            .route("/", "hello")
+            .route("/bye", "bye")
+            .run();
+
+        let host = "disco.test.svc.cluster.local";
+        let ctrl = controller::new();
+        let dst = ctrl.destination_tx(host);
+        // Start by "knowing" the first server...
+        dst.send_addr(srv1.addr);
+
+        let proxy = proxy::new().controller(ctrl.run()).run();
+        let client = client::http2(proxy.outbound, host);
+        let metrics = client::http1(proxy.metrics, "localhost");
+
+        assert_eq!(client.get("/"), "hello");
+
+        // Simulate the first server falling over without discovery
+        // knowing about it...
+        drop(srv1);
+
+        // Wait until the proxy has seen the `srv1` disconnect...
+        assert_eventually_contains!(
+            metrics.get("/metrics"),
+            "tcp_close_total{direction=\"outbound\",peer=\"dst\",tls=\"no_identity\",no_tls_reason=\"not_provided_by_service_discovery\",errno=\"\"} 1"
+        );
+
+        // Start a new request to the destination, now that the server is dead.
+        // This request should be waiting at the balancer for a ready endpoint.
+        //
+        // The only one it knows about is dead, so it won't have progressed.
+        let fut = client.request_async(&mut client.request_builder("/bye"));
+
+        // When we tell the balancer about a new endpoint, it should have added
+        // it and then dispatched the request...
+        dst.send_addr(srv2.addr);
+
+        let res = fut.wait().expect("/bye response");
+        assert_eq!(res.status(), http::StatusCode::OK);
+    }
 }
 
 mod http1 {

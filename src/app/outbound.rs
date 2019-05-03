@@ -5,6 +5,8 @@ use std::{fmt, hash};
 
 use super::identity;
 use control::destination::{Metadata, ProtocolHint};
+use proxy::http::balance::{HasWeight, Weight};
+use proxy::http::settings;
 use tap;
 use transport::{connect, tls};
 use {Conditional, NameAddr};
@@ -15,6 +17,7 @@ pub struct Endpoint {
     pub addr: SocketAddr,
     pub identity: tls::PeerIdentity,
     pub metadata: Metadata,
+    pub http_settings: settings::Settings,
 }
 
 // === impl Endpoint ===
@@ -22,8 +25,23 @@ pub struct Endpoint {
 impl Endpoint {
     pub fn can_use_orig_proto(&self) -> bool {
         match self.metadata.protocol_hint() {
-            ProtocolHint::Unknown => false,
-            ProtocolHint::Http2 => true,
+            ProtocolHint::Unknown => return false,
+            ProtocolHint::Http2 => (),
+        }
+
+        match self.http_settings {
+            settings::Settings::Http2 => false,
+            settings::Settings::Http1 {
+                keep_alive: _,
+                wants_h1_upgrade,
+                was_absolute_form: _,
+            } => !wants_h1_upgrade,
+            settings::Settings::NotHttp => {
+                unreachable!(
+                    "Endpoint::can_use_orig_proto called when NotHttp: {:?}",
+                    self,
+                );
+            }
         }
     }
 }
@@ -35,6 +53,7 @@ impl From<SocketAddr> for Endpoint {
             dst_name: None,
             identity: Conditional::None(tls::ReasonForNoPeerName::NotHttp.into()),
             metadata: Metadata::empty(),
+            http_settings: settings::Settings::NotHttp,
         }
     }
 }
@@ -50,6 +69,7 @@ impl hash::Hash for Endpoint {
         self.dst_name.hash(state);
         self.addr.hash(state);
         self.identity.hash(state);
+        self.http_settings.hash(state);
         // Ignore metadata.
     }
 }
@@ -63,6 +83,18 @@ impl tls::HasPeerIdentity for Endpoint {
 impl connect::HasPeerAddr for Endpoint {
     fn peer_addr(&self) -> SocketAddr {
         self.addr
+    }
+}
+
+impl HasWeight for Endpoint {
+    fn weight(&self) -> Weight {
+        self.metadata.weight()
+    }
+}
+
+impl settings::HasSettings for Endpoint {
+    fn http_settings(&self) -> &settings::Settings {
+        &self.http_settings
     }
 }
 
@@ -113,7 +145,7 @@ pub mod discovery {
     use super::super::dst::DstAddr;
     use super::Endpoint;
     use control::destination::Metadata;
-    use proxy::resolve;
+    use proxy::{http::settings, resolve};
     use transport::tls;
     use {Addr, Conditional, NameAddr};
 
@@ -121,7 +153,13 @@ pub mod discovery {
     pub struct Resolve<R: resolve::Resolve<NameAddr>>(R);
 
     #[derive(Debug)]
-    pub enum Resolution<R: resolve::Resolution> {
+    pub struct Resolution<R: resolve::Resolution> {
+        resolving: Resolving<R>,
+        http_settings: settings::Settings,
+    }
+
+    #[derive(Debug)]
+    enum Resolving<R: resolve::Resolution> {
         Name(NameAddr, R),
         Addr(Option<SocketAddr>),
     }
@@ -145,9 +183,14 @@ pub mod discovery {
         type Resolution = Resolution<R::Resolution>;
 
         fn resolve(&self, dst: &DstAddr) -> Self::Resolution {
-            match dst.as_ref() {
-                Addr::Name(ref name) => Resolution::Name(name.clone(), self.0.resolve(&name)),
-                Addr::Socket(ref addr) => Resolution::Addr(Some(*addr)),
+            let resolving = match dst.as_ref() {
+                Addr::Name(ref name) => Resolving::Name(name.clone(), self.0.resolve(&name)),
+                Addr::Socket(ref addr) => Resolving::Addr(Some(*addr)),
+            };
+
+            Resolution {
+                http_settings: dst.http_settings,
+                resolving,
             }
         }
     }
@@ -162,8 +205,8 @@ pub mod discovery {
         type Error = R::Error;
 
         fn poll(&mut self) -> Poll<resolve::Update<Self::Endpoint>, Self::Error> {
-            match self {
-                Resolution::Name(ref name, ref mut res) => match try_ready!(res.poll()) {
+            match self.resolving {
+                Resolving::Name(ref name, ref mut res) => match try_ready!(res.poll()) {
                     resolve::Update::Remove(addr) => {
                         debug!("removing {}", addr);
                         Ok(Async::Ready(resolve::Update::Remove(addr)))
@@ -184,11 +227,12 @@ pub mod discovery {
                             addr,
                             identity,
                             metadata,
+                            http_settings: self.http_settings,
                         };
                         Ok(Async::Ready(resolve::Update::Add(addr, ep)))
                     }
                 },
-                Resolution::Addr(ref mut addr) => match addr.take() {
+                Resolving::Addr(ref mut addr) => match addr.take() {
                     Some(addr) => {
                         let ep = Endpoint {
                             dst_name: None,
@@ -197,6 +241,7 @@ pub mod discovery {
                                 tls::ReasonForNoPeerName::NoAuthorityInHttpRequest.into(),
                             ),
                             metadata: Metadata::empty(),
+                            http_settings: self.http_settings,
                         };
                         Ok(Async::Ready(resolve::Update::Add(addr, ep)))
                     }
@@ -210,18 +255,25 @@ pub mod discovery {
 pub mod orig_proto_upgrade {
     use std::marker::PhantomData;
 
+    use futures::{Future, Poll};
     use http;
 
     use super::Endpoint;
-    use proxy::http::orig_proto;
+    use proxy::http::{orig_proto, settings::Settings};
     use svc;
 
     #[derive(Debug)]
     pub struct Layer<A, B>(PhantomData<fn(A) -> B>);
 
     #[derive(Debug)]
-    pub struct Stack<M, A, B> {
+    pub struct MakeSvc<M, A, B> {
         inner: M,
+        _marker: PhantomData<fn(A) -> B>,
+    }
+
+    pub struct MakeFuture<F, A, B> {
+        can_upgrade: bool,
+        inner: F,
         _marker: PhantomData<fn(A) -> B>,
     }
 
@@ -235,54 +287,81 @@ pub mod orig_proto_upgrade {
         }
     }
 
-    impl<M, A, B> svc::Layer<Endpoint, Endpoint, M> for Layer<A, B>
+    impl<M, A, B> svc::Layer<M> for Layer<A, B>
     where
-        M: svc::Stack<Endpoint>,
-        M::Value: svc::Service<http::Request<A>, Response = http::Response<B>>,
+        M: svc::MakeService<Endpoint, http::Request<A>, Response = http::Response<B>>,
     {
-        type Value = <Stack<M, A, B> as svc::Stack<Endpoint>>::Value;
-        type Error = <Stack<M, A, B> as svc::Stack<Endpoint>>::Error;
-        type Stack = Stack<M, A, B>;
+        type Service = MakeSvc<M, A, B>;
 
-        fn bind(&self, inner: M) -> Self::Stack {
-            Stack {
+        fn layer(&self, inner: M) -> Self::Service {
+            MakeSvc {
                 inner,
                 _marker: PhantomData,
             }
         }
     }
 
-    // === impl Stack ===
+    // === impl MakeSvc ===
 
-    impl<M: Clone, A, B> Clone for Stack<M, A, B> {
+    impl<M: Clone, A, B> Clone for MakeSvc<M, A, B> {
         fn clone(&self) -> Self {
-            Stack {
+            MakeSvc {
                 inner: self.inner.clone(),
                 _marker: PhantomData,
             }
         }
     }
 
-    impl<M, A, B> svc::Stack<Endpoint> for Stack<M, A, B>
+    impl<M, A, B> svc::Service<Endpoint> for MakeSvc<M, A, B>
     where
-        M: svc::Stack<Endpoint>,
-        M::Value: svc::Service<http::Request<A>, Response = http::Response<B>>,
+        M: svc::MakeService<Endpoint, http::Request<A>, Response = http::Response<B>>,
     {
-        type Value = svc::Either<orig_proto::Upgrade<M::Value>, M::Value>;
-        type Error = M::Error;
+        type Response = svc::Either<orig_proto::Upgrade<M::Service>, M::Service>;
+        type Error = M::MakeError;
+        type Future = MakeFuture<M::Future, A, B>;
 
-        fn make(&self, endpoint: &Endpoint) -> Result<Self::Value, Self::Error> {
-            if endpoint.can_use_orig_proto() {
+        fn poll_ready(&mut self) -> Poll<(), Self::Error> {
+            self.inner.poll_ready()
+        }
+
+        fn call(&mut self, mut endpoint: Endpoint) -> Self::Future {
+            let can_upgrade = endpoint.can_use_orig_proto();
+
+            if can_upgrade {
                 trace!(
                     "supporting {} upgrades for endpoint={:?}",
                     orig_proto::L5D_ORIG_PROTO,
                     endpoint,
                 );
-                self.inner
-                    .make(&endpoint)
-                    .map(|i| svc::Either::A(orig_proto::Upgrade::new(i)))
+                endpoint.http_settings = Settings::Http2;
+            }
+
+            let inner = self.inner.make_service(endpoint);
+            MakeFuture {
+                can_upgrade,
+                inner,
+                _marker: PhantomData,
+            }
+        }
+    }
+
+    // === impl MakeFuture ===
+
+    impl<F, A, B> Future for MakeFuture<F, A, B>
+    where
+        F: Future,
+        F::Item: svc::Service<http::Request<A>, Response = http::Response<B>>,
+    {
+        type Item = svc::Either<orig_proto::Upgrade<F::Item>, F::Item>;
+        type Error = F::Error;
+
+        fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+            let inner = try_ready!(self.inner.poll());
+
+            if self.can_upgrade {
+                Ok(svc::Either::A(orig_proto::Upgrade::new(inner)).into())
             } else {
-                self.inner.make(&endpoint).map(svc::Either::B)
+                Ok(svc::Either::B(inner).into())
             }
         }
     }
